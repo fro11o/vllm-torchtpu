@@ -198,12 +198,16 @@ def _dequantize_packed_nope(nope_words: np.ndarray) -> np.ndarray:
     return np.asarray(fp8_vals) * np.tile(scales, (1, 7))
 
 
-def test_should_export_four_single_bank_dsv41_ops_without_inert_specs() -> None:
+def test_should_export_eight_single_bank_dsv41_ops_without_inert_specs() -> None:
     expected_exports = [
         "dsv41_gather_cache_rows",
+        "dsv41_gather_sparse_fp8_kv",
         "dsv41_gather_swa_windows",
         "dsv41_pack_fp8_kv_rows",
+        "dsv41_paged_indexer_topk",
+        "dsv41_sparse_mla_swa_attention",
         "dsv41_write_sub_rows",
+        "get_mhc_post_op",
     ]
     assert dsv41_ops.__all__ == expected_exports
     for name in expected_exports:
