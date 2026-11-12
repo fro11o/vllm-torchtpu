@@ -658,6 +658,12 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
     return next(iter(found.values()))
 
 
+# Avoid single-slot H2D overwrite races under V1 async_scheduling
+# (max_concurrent_batches=2): 4 ring slots give 2x headroom plus event fences.
+_LOOKBACK_RING_DEPTH: int = 4
+_LOOKBACK_PAD_TOKEN_ID: int = -1
+
+
 # Recompilation-avoidance contract:
 #   1. Input prep happens on CPU; H2D via `cpu_tensor.to(xla_device)`.
 #   2. Forward is split into 4 `@torch.compile(backend="tpu")` subgraphs
@@ -678,6 +684,12 @@ class TPUModelRunner(GPUModelRunner):
     # Defaults for a runner built without __init__.
     _pp_wave: PPWave | PPRing | None = None
     _dp_step_other_decode: bool = False
+    _replay_starts: dict[str, int] | None = None
+    _uses_rpa_smem_page_table: bool = True
+    _lookback_staging_ring: tuple[Any, ...] | None = None
+    _lookback_staging_fences: list[Any] | None = None
+    _lookback_staging_idx: int = 0
+    _lookback_chunk_span: tuple[int, int] | None = None
     _adaptive_verification: AdaptiveVerificationManager | None = None
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
@@ -1026,6 +1038,12 @@ class TPUModelRunner(GPUModelRunner):
         # mapping (built in initialize_kv_cache), and the block-seed copies
         # staged by _prepare_inputs and flushed before the forward.
         self._mamba_state_pos: dict[str, int] = {}
+        self._replay_starts: dict[str, int] = {}
+        self._uses_rpa_smem_page_table: bool = True
+        self._lookback_staging_ring: tuple[Any, ...] | None = None
+        self._lookback_staging_fences: list[Any] | None = None
+        self._lookback_staging_idx: int = 0
+        self._lookback_chunk_span: tuple[int, int] | None = None
         self._mamba_copy_plan: list[tuple[int, list[torch.Tensor]]] = []
         # Manager-block -> pool-block split: >1 when the pool is born at a
         # smaller attention-kernel granularity (batched RPA).
@@ -1864,7 +1882,9 @@ class TPUModelRunner(GPUModelRunner):
     # KV-cache spec derivation, sizing and allocation live on
     # `self.kv_cache_manager` now; these forward the runner's existing callers.
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        self._refresh_smem_request_caps()
+        self._refresh_smem_request_caps(
+            uses_rpa_smem_page_table=self._uses_rpa_smem_page_table
+        )
         with set_current_vllm_config(self.vllm_config):
             return self.kv_cache_manager.get_kv_cache_spec()
 
@@ -2815,6 +2835,99 @@ class TPUModelRunner(GPUModelRunner):
         input_batch.update_req_spec_token_ids = guarded
         input_batch._tpu_spec_room_guard = True
 
+    def _prefix_replay_tokens(self) -> int:
+        config = self.kv_cache_config
+        if not isinstance(config, KVCacheConfig):
+            return 0
+        return max(
+            (
+                group.kv_cache_spec.prefix_replay_tokens
+                for group in config.kv_cache_groups
+            ),
+            default=0,
+        )
+
+    def _build_replay_starts_cpu(
+        self, start_index: int, num_reqs: int, target_num_reqs: int
+    ) -> tuple[int, ...]:
+        replay_starts = self._replay_starts
+        if replay_starts is None or not self._prefix_replay_tokens():
+            return (0,) * target_num_reqs
+        active = tuple(
+            replay_starts.get(req_id, 0)
+            for req_id in self.input_batch.req_ids[start_index : start_index + num_reqs]
+        )
+        return active + (0,) * (target_num_reqs - num_reqs)
+
+    def _record_replay_starts(self, scheduler_output: "SchedulerOutput") -> None:
+        replay_starts = self._replay_starts
+        if replay_starts is None or not self._prefix_replay_tokens():
+            return
+        for new_req in scheduler_output.scheduled_new_reqs:
+            if new_req.replay_start > 0:
+                replay_starts[new_req.req_id] = new_req.replay_start
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for idx, req_id in enumerate(cached_reqs.req_ids):
+            if req_id in cached_reqs.resumed_req_ids:
+                computed = cached_reqs.num_computed_tokens[idx]
+                if computed > 0:
+                    replay_starts[req_id] = computed
+
+    def _prepare_lookback_token_ids(
+        self, num_reqs: int, start_index: int = 0
+    ) -> torch.Tensor:
+        ring = self._lookback_staging_ring
+        fences: list[Any] | None = None
+        slot_idx = 0
+        if self.scheduler_config.async_scheduling and ring is not None:
+            fences = self._lookback_staging_fences
+            if fences is None or len(fences) != len(ring):
+                fences = [None] * len(ring)
+                self._lookback_staging_fences = fences
+            slot_idx = self._lookback_staging_idx % len(ring)
+            prior_fence = fences[slot_idx]
+            if prior_fence is not None:
+                prior_fence.synchronize()
+                fences[slot_idx] = None
+            staging_buf = ring[slot_idx]
+            self._lookback_staging_idx += 1
+            self.lookback_token_ids = staging_buf
+        else:
+            staging_buf = self.lookback_token_ids
+        assert staging_buf is not None
+        staging_buf.np.fill(_LOOKBACK_PAD_TOKEN_ID)
+        if num_reqs > 0:
+            depth = staging_buf.np.shape[1]
+            end_idx = start_index + num_reqs
+            starts = self.input_batch.num_computed_tokens_cpu[start_index:end_idx, None]
+            lookback_positions = starts - np.arange(1, depth + 1)
+            limits = self.input_batch.num_prompt_tokens[start_index:end_idx, None]
+            replay_starts = self._replay_starts
+            if replay_starts:
+                chunk_req_ids = self.input_batch.req_ids[start_index:end_idx]
+                limits = limits.copy()
+                for row, req_id in enumerate(chunk_req_ids):
+                    batch_row = start_index + row
+                    if replay_starts.get(req_id) == int(starts[row, 0]):
+                        limits[row, 0] = int(
+                            self.input_batch.num_tokens_no_spec[batch_row]
+                        )
+            valid_mask = (lookback_positions >= 0) & (lookback_positions < limits)
+            batch_rows = np.arange(start_index, end_idx)[:, None]
+            gathered_token_ids = self.input_batch.token_ids_cpu[
+                batch_rows, np.clip(lookback_positions, 0, None)
+            ]
+            staging_buf.np[:num_reqs] = np.where(
+                valid_mask, gathered_token_ids, _LOOKBACK_PAD_TOKEN_ID
+            )
+        lookback_device_tensor = staging_buf.copy_to_gpu()
+        if fences is not None and self.device.type == "tpu":
+            # pyrefly: ignore[missing-attribute]
+            fence = torch.tpu.Event()
+            fence.record()
+            fences[slot_idx] = fence
+        return lookback_device_tensor
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
         invalidated_req_ids = (
             scheduler_output.finished_req_ids
@@ -2826,6 +2939,8 @@ class TPUModelRunner(GPUModelRunner):
             slot = self._mamba_slot_by_req_id.pop(req_id, None)
             if slot is not None:
                 self._free_mamba_slots.append(slot)
+            if self._replay_starts is not None:
+                self._replay_starts.pop(req_id, None)
         self._mamba_offset_seeded.difference_update(invalidated_req_ids)
         if self._pre_async_results is not None and invalidated_req_ids:
             # These results belong to freed KV state, including a finished ID
@@ -2862,6 +2977,7 @@ class TPUModelRunner(GPUModelRunner):
         self._min_tokens.discard(scheduler_output.finished_req_ids)
         for new_req in scheduler_output.scheduled_new_reqs:
             self._min_tokens.add(new_req.req_id, new_req.sampling_params)
+        self._record_replay_starts(scheduler_output)
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
@@ -3743,6 +3859,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._prefill_ckpt_offsets_cpu[:target_num_reqs],
             )
 
+        self._lookback_chunk_span = (start_index, num_reqs)
         self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
@@ -3750,6 +3867,37 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
+            query_start_loc_cpu=(
+                tuple(int(v) for v in self.query_start_loc_np[: target_num_reqs + 1])
+                if layout_plan.kind is SequenceLayoutKind.ALL
+                else None
+            ),
+            seq_lens_cpu=(
+                (
+                    tuple(int(v) for v in self.seq_lens_np[:num_reqs])
+                    + (0,) * (target_num_reqs - num_reqs)
+                )
+                if layout_plan.kind is SequenceLayoutKind.ALL
+                else None
+            ),
+            prompt_lens_cpu=(
+                (
+                    tuple(
+                        int(v)
+                        for v in self.input_batch.num_prompt_tokens[
+                            start_index : start_index + num_reqs
+                        ]
+                    )
+                    + (0,) * (target_num_reqs - num_reqs)
+                )
+                if layout_plan.kind is SequenceLayoutKind.ALL
+                else None
+            ),
+            replay_starts_cpu=(
+                self._build_replay_starts_cpu(start_index, num_reqs, target_num_reqs)
+                if layout_plan.kind is SequenceLayoutKind.ALL
+                else None
+            ),
             mamba_state_indices=mamba_state_indices,
             mamba_slot_read_offsets=self.mamba_slot_read_offsets,
             mamba_ckpt_window=self._mamba_ckpt_window,
@@ -5837,6 +5985,28 @@ class TPUModelRunner(GPUModelRunner):
         ), "TPU_DP_VOCAB_PARALLEL does not support selected logits hidden states"
         if self.is_pooling_model:
             self._resolve_static_pooler()
+        # Avoid super().load_model() GPU device assumptions: wire lookback ring and
+        # SMEM caps here because TPUModelRunner overrides load_model without super().
+        if isinstance(self.model, utils.TokenLookbackModel):
+            depth = self.model.token_lookback_depth
+            if depth > 0:
+                self._lookback_staging_ring = tuple(
+                    self._make_buffer(self.max_num_reqs, depth, dtype=torch.int32)
+                    for _ in range(_LOOKBACK_RING_DEPTH)
+                )
+                self._lookback_staging_fences = [None] * _LOOKBACK_RING_DEPTH
+                self._lookback_staging_idx = 0
+                self.lookback_token_ids = self._lookback_staging_ring[0]
+            else:
+                self._lookback_staging_ring = None
+                self._lookback_staging_fences = None
+                self.lookback_token_ids = None
+        if isinstance(self.model, utils.RpaSmemPageTableModel):
+            self._uses_rpa_smem_page_table = self.model.uses_rpa_smem_page_table
+            if not self._uses_rpa_smem_page_table:
+                self._refresh_smem_request_caps(
+                    uses_rpa_smem_page_table=self._uses_rpa_smem_page_table
+                )
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
@@ -6250,6 +6420,7 @@ class TPUModelRunner(GPUModelRunner):
             kv_cache_initialized=kv_cache_initialized,
         )
 
+        self._lookback_chunk_span = (0, num_reqs)
         if self.kv_cache_config is not None:
             # Dummy compact-mamba slot ids (all null slot 0): the dummy run
             # only traces shapes/HBM, so the recurrent state read/written is
@@ -6285,6 +6456,18 @@ class TPUModelRunner(GPUModelRunner):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 position_ids_override=position_ids,
+                # Avoid None on idle dp_lockstep ranks: None signals startup warmup
+                # to trace the full padded decoder bucket instead of 0 active rows.
+                query_start_loc_cpu=(
+                    (0,) * (num_reqs + 1) if dp_lockstep and not profiling else None
+                ),
+                seq_lens_cpu=(0,) * num_reqs if dp_lockstep and not profiling else None,
+                prompt_lens_cpu=(
+                    (0,) * num_reqs if dp_lockstep and not profiling else None
+                ),
+                replay_starts_cpu=(
+                    (0,) * num_reqs if dp_lockstep and not profiling else None
+                ),
                 mamba_state_indices=dummy_mamba_state_indices,
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
                 mamba_ckpt_window=self._mamba_ckpt_window,
@@ -8592,7 +8775,10 @@ class TPUModelRunner(GPUModelRunner):
         raise NotImplementedError(f"Unsupported KV cache spec: {type(kv_cache_spec)!r}")
 
     def _refresh_smem_request_caps(
-        self, kv_cache_config: KVCacheConfig | None = None
+        self,
+        kv_cache_config: KVCacheConfig | None = None,
+        *,
+        uses_rpa_smem_page_table: bool = True,
     ) -> None:
         """Use the widest attention table each kernel invocation will prefetch.
 
@@ -8651,7 +8837,11 @@ class TPUModelRunner(GPUModelRunner):
             return cdiv(model_len, self.block_size)
 
         self.num_reqs_max_model_len = min(
-            PallasAttentionBackend.get_max_num_seqs_for_pages(widest_table(None)),
+            (
+                PallasAttentionBackend.get_max_num_seqs_for_pages(widest_table(None))
+                if uses_rpa_smem_page_table
+                else self.max_num_reqs
+            ),
             self.max_num_reqs,
             self.max_num_tokens,
         )
@@ -8659,7 +8849,11 @@ class TPUModelRunner(GPUModelRunner):
         if self.most_model_len is not None:
             pages = widest_table(self.most_model_len)
             self.num_reqs_most_model_len = min(
-                PallasAttentionBackend.get_max_num_seqs_for_pages(pages),
+                (
+                    PallasAttentionBackend.get_max_num_seqs_for_pages(pages)
+                    if uses_rpa_smem_page_table
+                    else self.max_num_reqs
+                ),
                 self.max_num_reqs,
                 self.max_num_tokens,
             )
@@ -8706,7 +8900,10 @@ class TPUModelRunner(GPUModelRunner):
                     dtype=torch.int32,
                     device="cpu",
                 )
-        self._refresh_smem_request_caps(kv_cache_config)
+        self._refresh_smem_request_caps(
+            kv_cache_config,
+            uses_rpa_smem_page_table=self._uses_rpa_smem_page_table,
+        )
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""
@@ -8729,6 +8926,20 @@ class TPUModelRunner(GPUModelRunner):
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
+        if (
+            isinstance(self.model, utils.TokenLookbackModel)
+            and self.lookback_token_ids is not None
+        ):
+            span = self._lookback_chunk_span
+            start_idx = 0 if span is None else span[0]
+            chunk_reqs = (
+                self.input_batch.num_reqs
+                if span is None
+                else min(span[1], max(0, self.input_batch.num_reqs - start_idx))
+            )
+            kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
+                chunk_reqs, start_index=start_idx
+            )
         out = self.model(
             input_ids=input_ids,
             positions=positions,

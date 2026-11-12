@@ -14,6 +14,7 @@
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
+from dataclasses import replace
 from functools import wraps
 
 import vllm_torchtpu.env_override  # noqa: F401
@@ -2159,6 +2160,44 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         "Applied TPU patch: register shard index bounds as buffers in "
         "VocabParallelEmbedding"
     )
+
+
+def _patch_dflash_sliding_window_retained_tokens() -> None:
+    from vllm.v1.core import (  # noqa: PLC0415 -- deferred vLLM import preserves env_override ordering
+        kv_cache_planning,
+    )
+    from vllm.v1.kv_cache_interface import (  # noqa: PLC0415 -- deferred vLLM import preserves env_override ordering
+        SlidingWindowSpec,
+    )
+
+    orig_groups = kv_cache_planning.get_kv_cache_groups
+    if getattr(orig_groups, "_tpu_swa_retained_tokens_patch", False):
+        return
+
+    @wraps(orig_groups)
+    def get_kv_cache_groups(vllm_config, kv_cache_spec):
+        spec_cfg = vllm_config.speculative_config
+        if spec_cfg is not None and spec_cfg.method in ("dflash", "dspark"):
+            lookahead = int(vllm_config.num_lookahead_tokens or 0)
+            min_retained = lookahead + 1 if lookahead > 0 else 0
+            if min_retained > 0:
+                for name, spec in list(kv_cache_spec.items()):
+                    if (
+                        isinstance(spec, SlidingWindowSpec)
+                        and spec.extra_retained_tokens < min_retained
+                    ):
+                        # Avoid upstream get_global_kv_cache_groups resetting
+                        # extra_retained_tokens to 0 before group creation.
+                        kv_cache_spec[name] = replace(
+                            spec, extra_retained_tokens=min_retained
+                        )
+        return orig_groups(vllm_config, kv_cache_spec)
+
+    setattr(  # noqa: B010 -- monkeypatch sentinel on get_kv_cache_groups
+        get_kv_cache_groups, "_tpu_swa_retained_tokens_patch", True
+    )
+    kv_cache_planning.get_kv_cache_groups = get_kv_cache_groups
+    logger.info("Applied TPU patch: DFlash/DSpark retain trailing SWA draft window.")
 
 
 def _patch_circular_buffer_block_zeroing() -> None:

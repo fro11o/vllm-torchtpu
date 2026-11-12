@@ -189,6 +189,15 @@ def _make_runner(
     runner._collect_mamba_state_seed_copies = (
         TPUModelRunner._collect_mamba_state_seed_copies.__get__(runner)
     )
+    runner._replay_starts = {}  # noqa: SLF001 -- test runner fixture exposes bounded-replay state
+    runner._prefix_replay_tokens = types.MethodType(  # noqa: SLF001 -- test runner fixture binds helper
+        TPUModelRunner._prefix_replay_tokens,  # noqa: SLF001 -- test runner fixture binds helper
+        runner,
+    )
+    runner._build_replay_starts_cpu = types.MethodType(  # noqa: SLF001 -- test runner fixture binds helper
+        TPUModelRunner._build_replay_starts_cpu,  # noqa: SLF001 -- test runner fixture binds helper
+        runner,
+    )
     runner._prepare_async_token_substitution_indices = lambda *_args, **_kwargs: (
         np.array([], dtype=np.int32),
         np.array([], dtype=np.int32),
