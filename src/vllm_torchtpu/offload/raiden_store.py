@@ -89,7 +89,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    CircularBufferSpec,
+    FullAttentionSpec,
+    KVCacheConfig,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     LoadStoreSpec,
@@ -220,6 +227,7 @@ def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
     """
     return vllm_config.model_config.architecture in (
         "DeepseekV4ForCausalLM",
+        "DeepseekV41ForCausalLM",
         "GlmMoeDsaForCausalLM",
     )
 
@@ -1549,12 +1557,12 @@ def is_multi_shapes_geometry(per_block_shape: object) -> bool:
 def _resolve_multi_shapes_kv_geometry(
     kv_cache_config: KVCacheConfig,
 ) -> tuple[int, set[tuple[int, ...]], set[object], int]:
-    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
-
     groups = kv_cache_config.kv_cache_groups
     for group in groups:
         for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec):
-            assert isinstance(leaf, (MLAAttentionSpec, SlidingWindowMLASpec)), (
+            assert isinstance(
+                leaf, (MLAAttentionSpec, SlidingWindowMLASpec, CircularBufferSpec)
+            ), (
                 "TPURaidenOffloadingConnector: an aliased KV "
                 "layout has only MLA-family layers; got "
                 f"{type(leaf).__name__}"

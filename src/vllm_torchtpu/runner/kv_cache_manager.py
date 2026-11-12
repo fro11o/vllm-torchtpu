@@ -21,7 +21,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
@@ -91,6 +91,10 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
+from vllm_torchtpu.runner.kv_cache_dsv41 import (
+    DsV41KVCacheAllocator,
+    is_cache_for_ds_v41,
+)
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
@@ -157,7 +161,7 @@ def sparse_mla_page_size_bytes(
 
 
 def check_kv_caches_cover_block_ids(
-    kv_caches: dict[str, torch.Tensor],
+    kv_caches: Mapping[str, torch.Tensor | tuple[torch.Tensor, ...]],
     kv_cache_tensors: Iterable[KVCacheTensor],
     num_blocks: int,
     spec_for_layer: Callable[[str], KVCacheSpec],
@@ -173,16 +177,17 @@ def check_kv_caches_cover_block_ids(
             kv_cache = kv_caches.get(layer_name)
             if kv_cache is None:
                 raise ValueError(f"Missing KV cache for attention layer {layer_name}")
-            if kv_cache.shape[0] < num_blocks:
-                raise ValueError(
-                    f"KV cache for {layer_name} holds {kv_cache.shape[0]} "
-                    f"blocks, but the scheduler can issue block IDs through "
-                    f"{num_blocks - 1} ({num_blocks} blocks; "
-                    f"{len(kv_cache_tensor.layers)} layer(s) in this "
-                    f"{kv_cache_tensor.size}-byte backing allocation). "
-                    "TPU kernels do not bounds-check these "
-                    "indices."
-                )
+            for buf in kv_cache if isinstance(kv_cache, tuple) else (kv_cache,):
+                if buf.shape[0] < num_blocks:
+                    raise ValueError(
+                        f"KV cache for {layer_name} holds {buf.shape[0]} "
+                        f"blocks, but the scheduler can issue block IDs through "
+                        f"{num_blocks - 1} ({num_blocks} blocks; "
+                        f"{len(kv_cache_tensor.layers)} layer(s) in this "
+                        f"{kv_cache_tensor.size}-byte backing allocation). "
+                        "TPU kernels do not bounds-check these "
+                        "indices."
+                    )
 
 
 def _warn_if_kv_cache_is_padded(
@@ -266,6 +271,7 @@ class KVCacheManager:
     def __init__(self, runner: TPUModelRunner) -> None:
         self.runner = runner
         self.ds_v4 = DsV4KVCacheAllocator(runner)
+        self.ds_v41 = DsV41KVCacheAllocator(runner)
         # Set when get_kv_cache_spec selects the compact-mamba layout.
         self._compact_mamba_sizing: _CompactMambaSizing | None = None
 
@@ -308,6 +314,7 @@ class KVCacheManager:
         # DSv4 layers whose specs must reach vLLM verbatim; see
         # `is_cache_for_ds_v4`.
         ds_v4_layers: set[str] = set()
+        ds_v41_layers: set[str] = set()
         # Sparse MLA layers sized from their allocated (nope, rope) specs,
         # which the normalizer's dense MLA page formula does not model.
         sparse_mla_layers: set[str] = set()
@@ -321,6 +328,11 @@ class KVCacheManager:
                         self.runner.vllm_config,
                         runner_owns_slots=runner_owns_mamba_slots,
                     )
+            elif is_cache_for_ds_v41(attn_module):
+                ds_v41_layers.add(layer_name)
+                spec = attn_module.get_kv_cache_spec(self.runner.vllm_config)
+                if spec is not None:
+                    kv_cache_spec[layer_name] = spec
             # DSv4's attention, SWA, compressor and indexer caches all build
             # their own specs, as the reference does.
             elif is_cache_for_ds_v4(attn_module):
@@ -525,14 +537,19 @@ class KVCacheManager:
             kv_cache_spec,
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
-            exempt_layers=ds_v4_layers | sparse_mla_layers,
+            exempt_layers=ds_v4_layers | ds_v41_layers | sparse_mla_layers,
             attention_backend=cast("type[PallasAttentionBackend] | None", backend_cls),
         )
+        if ds_v41_layers:
+            kv_cache_spec = self.ds_v41.prepare_kv_cache_specs(
+                kv_cache_spec, block_size
+            )
         if (
             hma_enabled
             and has_attention
             and not has_mamba
             and not ds_v4_layers
+            and not ds_v41_layers
             and not self.runner._unified_kv_layout
         ):
             assert backend_cls is not None
@@ -1609,14 +1626,20 @@ class KVCacheManager:
                 return spec.kv_cache_specs[layer_name]
             return spec
 
+        forward_context = (
+            self.runner.vllm_config.compilation_config.static_forward_context
+        )
+        _is_ds_v41 = any(
+            is_cache_for_ds_v41(module) for module in forward_context.values()
+        )
         # DSv4's packed layout and cache overlays are handled entirely in
         # `_initialize_ds_v4_kv_cache`, so the loop below stays DSv4-free.
         # TODO(patemotter): replace per-model flags (`_unified_kv_layout`,
         # `_is_ds_v4`) with per-layout allocation dispatch around a shared tail.
-        _is_ds_v4 = any(
-            is_cache_for_ds_v4(module)
-            for module in self.runner.vllm_config.compilation_config.static_forward_context.values()  # noqa: E501
+        _is_ds_v4 = not _is_ds_v41 and any(
+            is_cache_for_ds_v4(module) for module in forward_context.values()
         )
+        self.runner.ds_v41_zero_owner = None
 
         # ---- Block-major KV Cache Initialization (VLLM_TPU_BLOCK_MAJOR_KV) ----
         # Bundles all attention layer fragments into a single contiguous array in HBM:
@@ -1642,6 +1665,8 @@ class KVCacheManager:
                 unsupported = "SPMD"
             elif kv_cache_config.has_mamba_layers:
                 unsupported = "hybrid attention+mamba models"
+            elif _is_ds_v41:
+                unsupported = "the DSv4.1 word-pool KV layout"
             elif _is_ds_v4:
                 unsupported = "the DSv4 packed KV layout"
             elif self.runner.parallel_config.prefill_context_parallel_size > 1:
@@ -1720,7 +1745,9 @@ class KVCacheManager:
                 bundle.dtype,
             )
 
-        if _is_ds_v4:
+        if _is_ds_v41:
+            self.ds_v41.initialize_kv_cache(kv_cache_config, _per_layer_spec, kv_caches)
+        elif _is_ds_v4:
             self.ds_v4._initialize_ds_v4_kv_cache(
                 kv_cache_config, _per_layer_spec, kv_caches, kv_cache_config.num_blocks
             )
@@ -1776,7 +1803,12 @@ class KVCacheManager:
             return caches
 
         shared_attention_caches: dict[tuple[int, int], torch.Tensor] = {}
-        if share_attention_regions and not use_block_major and not _is_ds_v4:
+        if (
+            share_attention_regions
+            and not use_block_major
+            and not _is_ds_v4
+            and not _is_ds_v41
+        ):
             region_specs: dict[tuple[int, int], list[tuple[str, KVCacheSpec]]] = {}
             for tensor in kv_cache_config.kv_cache_tensors:
                 for index, name in enumerate(tensor.layers):
@@ -1812,7 +1844,9 @@ class KVCacheManager:
                 )
             device_caches.extend(shared_attention_caches.values())
 
-        for kv_cache_tensor in [] if _is_ds_v4 else kv_cache_config.kv_cache_tensors:
+        for kv_cache_tensor in (
+            [] if (_is_ds_v4 or _is_ds_v41) else kv_cache_config.kv_cache_tensors
+        ):
             # Each descriptor names layers within the whole backing allocation;
             # its size is not a per-layer budget. TPU's separate typed caches
             # use the scheduler's block count and the normalized page geometry.
@@ -1956,9 +1990,11 @@ class KVCacheManager:
         # This is the native vLLM pattern and avoids the 'layer_id' attribute error
         utils.tpu_bind_kv_cache(
             kv_caches,
-            self.runner.vllm_config.compilation_config.static_forward_context,
+            forward_context,
             self.runner.kv_caches,
         )
+        if _is_ds_v41:
+            self.ds_v41.bind_paged_caches(forward_context)
 
         # Pre-build and cache bundled RPA kernels across all attention layers before
         # torch.compile tracing.

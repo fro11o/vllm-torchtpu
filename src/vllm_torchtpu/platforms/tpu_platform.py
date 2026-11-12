@@ -901,9 +901,9 @@ class TpuPlatform(Platform):
         else:
             backend = PallasAttentionBackend
         supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
-        if (
-            vllm_config.model_config is not None
-            and "DeepseekV4ForCausalLM" in vllm_config.model_config.architectures
+        if vllm_config.model_config is not None and any(
+            arch in vllm_config.model_config.architectures
+            for arch in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
         ):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])

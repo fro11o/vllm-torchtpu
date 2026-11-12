@@ -165,6 +165,7 @@ from vllm_torchtpu.runner import greedy_top_tokens, spec_boundary_state
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
+from vllm_torchtpu.runner.kv_cache_dsv41 import DsV41BlockZeroOwner
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
@@ -685,6 +686,7 @@ class TPUModelRunner(GPUModelRunner):
     _pp_wave: PPWave | PPRing | None = None
     _dp_step_other_decode: bool = False
     _replay_starts: dict[str, int] | None = None
+    ds_v41_zero_owner: DsV41BlockZeroOwner | None = None
     _uses_rpa_smem_page_table: bool = True
     _lookback_staging_ring: tuple[Any, ...] | None = None
     _lookback_staging_fences: list[Any] | None = None
@@ -1207,6 +1209,7 @@ class TPUModelRunner(GPUModelRunner):
         self._token_padding_state: token_padding.TokenPaddingState | None = None
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
+        self.ds_v41_zero_owner: DsV41BlockZeroOwner | None = None
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
@@ -2435,6 +2438,16 @@ class TPUModelRunner(GPUModelRunner):
             return
         (pool,) = raws
         copy_mamba_state_rows(pool, src, dst, layout.num_pools, layout.split)
+
+    def _zero_block_ids(self, block_ids: list[int]) -> None:
+        if self.ds_v41_zero_owner is not None:
+            self.ds_v41_zero_owner.zero_blocks(
+                block_ids,
+                split=self._pool_block_split,
+                copy_blocks_fn=self._copy_mamba_state_blocks,
+            )
+            return
+        super()._zero_block_ids(block_ids)
 
     def is_unified_pool_used(self) -> bool:
         """Whether the attention-shaped unified KV block pool is active
