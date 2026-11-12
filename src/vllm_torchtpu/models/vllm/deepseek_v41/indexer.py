@@ -252,7 +252,7 @@ class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
         self.indexer_op.bind_select_topk(self.select_topk)
         self._last_positions: Tensor | None = None
 
-    def _produce_k(
+    def produce_k(
         self,
         latent: Tensor | None,
         positions: Tensor,
@@ -310,7 +310,7 @@ class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
         rotary_emb: nn.Module,
         q_lora_scale: Tensor | None = None,
     ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
-        self._produce_k(latent, positions, rotary_emb)
+        self.produce_k(latent, positions, rotary_emb)
         self._last_positions = positions
         return self.forward_q(
             q_lora, q_lora_scale, indexer_weights, positions, rotary_emb
