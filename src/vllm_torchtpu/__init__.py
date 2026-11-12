@@ -14,6 +14,8 @@
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
+from functools import wraps
+
 import vllm_torchtpu.env_override  # noqa: F401
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
@@ -2157,3 +2159,49 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
         "Applied TPU patch: register shard index bounds as buffers in "
         "VocabParallelEmbedding"
     )
+
+
+def _patch_circular_buffer_block_zeroing() -> None:
+    """Record newly claimed CircularBufferSpec block IDs when zeroing is active."""
+    from vllm.v1.core.single_type_kv_cache_manager import (  # noqa: PLC0415 -- deferred vLLM import preserves env_override ordering
+        CircularBufferManager,
+    )
+
+    original_init = CircularBufferManager.__init__
+    if getattr(original_init, "_tpu_circular_zeroing_patch", False):
+        return
+
+    @wraps(original_init)
+    def patched_init(
+        self: CircularBufferManager,
+        kv_cache_spec,
+        block_pool,
+        enable_caching: bool,
+        kv_cache_group_id: int,
+        scheduler_block_size: int,
+        dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
+        needs_kv_cache_zeroing: bool = False,
+        max_admission_blocks_per_request: int | None = None,
+    ) -> None:
+        original_init(
+            self,
+            kv_cache_spec,
+            block_pool,
+            enable_caching,
+            kv_cache_group_id,
+            scheduler_block_size,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=pcp_world_size,
+            needs_kv_cache_zeroing=needs_kv_cache_zeroing,
+            max_admission_blocks_per_request=max_admission_blocks_per_request,
+        )
+        if needs_kv_cache_zeroing:
+            # Avoid SingleTypeKVCacheManager.__init__ skipping CircularBufferSpec:
+            # emit new_block_ids when KV zeroing is requested.
+            self._record_new_block_ids = True  # noqa: SLF001 -- upstream flag gating new_block_ids tracking
+
+    setattr(  # noqa: B010 -- monkeypatch sentinel on __init__
+        patched_init, "_tpu_circular_zeroing_patch", True
+    )
+    CircularBufferManager.__init__ = patched_init

@@ -518,6 +518,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                     target_num_blocks + ctx.mamba_ckpt_window - 1,
                     block_table_obj.max_num_blocks_per_req,
                 )
+            # Avoid exceeding fixed per-request ring/state row capacity when
+            # most_model_len > block_size * max_num_blocks_per_req.
+            target_num_blocks = min(
+                target_num_blocks, block_table_obj.max_num_blocks_per_req
+            )
         return block_table_obj, target_num_blocks
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
