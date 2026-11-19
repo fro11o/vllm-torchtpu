@@ -149,6 +149,7 @@ class PagedCacheRows:
             or self.page_stride % rows_per_page != 0
         )
         if misaligned_layout or raw_word_rows % rows_per_page != 0:
+            # Signal caller to fall back to per-token `row_indices()` lookup.
             return None
         page_scale = self.page_stride // rows_per_page
         page_offset = self.row_offset // rows_per_page

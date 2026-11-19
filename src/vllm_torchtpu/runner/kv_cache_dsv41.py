@@ -80,6 +80,8 @@ class DsV41BlockZeroOwner(Protocol):
     ) -> None: ...
 
 
+# Structural view of `TPUModelRunner`: avoids a circular import with
+# `tpu_runner.py` (which imports this module) and lets unit tests pass stubs.
 class DsV41RunnerHost(Protocol):
     """Structural runner contract required by ``DsV41KVCacheAllocator``."""
 
@@ -127,6 +129,8 @@ def _smallest_power_of_two_at_least(value: int) -> int:
 def _mla_nope_rows(spec: MLAAttentionSpec, block_size: int | None = None) -> int:
     bs = spec.block_size if block_size is None else block_size
     num_states = bs // int(spec.tokens_per_state)
+    # Use `head_size` (512B NoPE-only, uint8), not `state_content_size_bytes`
+    # (640B = NoPE + 128B RoPE), since RoPE lives in a separate 1:4 pool.
     return (num_states * spec.head_size) // ROW_BYTES
 
 
@@ -318,10 +322,15 @@ class DsV41KVCacheAllocator:
             if state_specs
             else 0
         )
+        # Let TensorCore Indexer bins merge up to at least one SWA/State page.
         tc_bin_cap = _smallest_power_of_two_at_least(
             max(_TARGET_HOST_ROWS, swa_rows, state_rows)
         )
 
+        # Widen `mla_bs` on tiny configs until host pools fit >= 1 SWA/State
+        # overlay slot. Here, "overlay" means SWA/State pages are co-located
+        # inside the physical NoPE and Indexer pools rather than allocating
+        # separate HBM tensors.
         while mla_bs * 2 <= _MAX_AUTO_MLA_BLOCK_SIZE:
             swa_ok = (
                 swa_rows == 0
@@ -347,6 +356,11 @@ class DsV41KVCacheAllocator:
                 spec, block_size=mla_bs, page_size_padded=None
             )
 
+        # `anchor_bytes` sums MLA NoPE + separate RoPE banks and Indexer pages,
+        # so `anchor_bytes // real_page_size_bytes` overcounts usable overlay
+        # slots. Count slots on non-RoPE host pools via
+        # `_conservative_overlay_slots`, then pad `page_size_padded` below so
+        # vLLM's `get_kv_cache_groups` caps each SWA/State group to fit.
         anchor_bytes = sum(
             updated[name].page_size_bytes for name, _ in (*mla_specs, *idx_specs)
         )
@@ -356,6 +370,8 @@ class DsV41KVCacheAllocator:
         state_slots = _conservative_overlay_slots(
             mla_specs, idx_specs, mla_bs, tc_bin_cap, state_rows
         )
+        # If host pools still cannot fit SWA/State, budget dedicated overflow
+        # rows into `target_block_bytes` so vLLM accounts for their HBM.
         extra_swa_rows = swa_rows if (swa_rows > 0 and swa_slots == 0) else 0
         if (
             state_rows > 0
@@ -546,12 +562,17 @@ class DsV41KVCacheAllocator:
                 for pos, (name, spec) in enumerate(group_layers):
                     page_rows = spec.real_page_size_bytes // ROW_BYTES
                     if page_rows == swa_rows:
+                        # Fallback when host pools have 0 slots (oversized
+                        # block_size or SWA-only tests); not hit on standard
+                        # DSv4.1 configs where host pools fit every group.
                         while pos >= len(swa_slots):
                             overflow = _alloc_pool(page_rows)
                             non_rope_hosts.append(overflow)
                             swa_slots.append((overflow, page_rows, 0))
                         raw_host, host_rows, row_offset = swa_slots[pos]
                     else:
+                        # Fallback for heterogeneous SWA page sizes; not hit on
+                        # DSv4.1 where all SWA layers share one spec.
                         overflow = _alloc_pool(page_rows)
                         non_rope_hosts.append(overflow)
                         raw_host, host_rows, row_offset = overflow, page_rows, 0
@@ -587,6 +608,8 @@ class DsV41KVCacheAllocator:
                 for pos, (name, spec) in enumerate(group_layers):
                     req_rows = spec.real_page_size_bytes // ROW_BYTES
                     if req_rows == state_rows:
+                        # Same 0-slot / heterogeneous fallbacks as SWA above
+                        # (not hit on standard DSv4.1 configs).
                         while pos >= len(state_slots):
                             overflow = _alloc_pool(req_rows)
                             non_rope_hosts.append(overflow)
@@ -688,6 +711,10 @@ class DsV41KVCacheAllocator:
             else 1
         )
         raw_cap = max(1, num_groups) * max(1, self.runner.max_num_reqs) * split
+        # Reuse runner's layout-agnostic block-copy program (named after Mamba
+        # but valid on any `(num_blocks, ...)` pool list) at precompiled 4^k
+        # bucket sizes: copy all-zero `null_block=0` onto `dst_ids`, padding
+        # tail lanes with `0` (`block 0 -> block 0` is a harmless no-op).
         chunk_cap = 8
         while chunk_cap < raw_cap:
             chunk_cap *= 4

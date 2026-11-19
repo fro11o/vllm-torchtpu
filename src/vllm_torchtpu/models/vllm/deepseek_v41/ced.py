@@ -106,11 +106,17 @@ def plan_decoder_replay(
         if end < start or seq_len < end - start or prompt_len < 0:
             raise ValueError("Invalid scheduled query or prompt length")
         prompt_tail_start = prompt_len - window if prompt_len > window else 0
+        # `TPUModelRunner._record_replay_starts` records `hit_start` as the
+        # prefix-hit token count minus `window`. This value comes from
+        # `new_req.replay_start` on admission, or `num_computed_tokens` on
+        # resume. On initial prefill, `prompt_tail_start` wins; if a decoding
+        # request past `prompt_len` is preempted and later resumed,
+        # `hit_start > prompt_tail_start` clamps `swa_min_pos` above empty SWA.
         replay_start = max(prompt_tail_start, hit_start)
         replay_starts.append(replay_start)
-        chunk_start_pos = seq_len - (end - start)
-        first_kept_offset = max(0, replay_start - chunk_start_pos)
-        kept_indices.extend(range(start + first_kept_offset, end))
+        chunk_start_pos = seq_len - (end - start)  # Chunk's sequence start pos
+        first_kept_offset = max(0, replay_start - chunk_start_pos)  # Rows to drop
+        kept_indices.extend(range(start + first_kept_offset, end))  # Keep tail
         out_query_bounds.append(len(kept_indices))
 
     kept_count = len(kept_indices)
