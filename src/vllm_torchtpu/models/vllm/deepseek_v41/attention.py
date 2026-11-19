@@ -190,13 +190,18 @@ def _gather_compressed_kv(
     comp_cu_q: Tensor,
 ) -> tuple[Tensor, Tensor]:
     if isinstance(comp_cache, PagedCacheRows):
+        # Production path: reshape bound single-bank HBM and RoPE pools.
         assert comp_cache.rope is not None
         mapped_bt = comp_cache.pages(comp_bt)
         if mapped_bt is None:
+            # Fallback for unaligned test layouts: flatten pool into one giant
+            # page and translate `topk_indices` via `row_indices()`.
             gather_topk, gather_bt, gather_page_size = _translate_unaligned_topk(
                 comp_cache, topk_indices, comp_bt, comp_cu_q
             )
         else:
+            # Production fast path: remap only `comp_bt` to sub-page IDs and
+            # keep `topk_indices` untouched.
             gather_page_size = comp_cache.shape[1]
             gather_topk = topk_indices
             gather_bt = mapped_bt
@@ -204,6 +209,7 @@ def _gather_compressed_kv(
         kv_pool = _pool_pages_3d(comp_cache.raw, gather_page_size)
         rope_pool = _pool_pages_3d(comp_cache.rope, rope_rows)
     else:
+        # Unit-test fallback: tests may pass a (kv_pool, rope_pool) tuple.
         kv_pool, rope_pool = comp_cache
         gather_page_size = kv_pool.shape[1]
         gather_topk = topk_indices
@@ -673,6 +679,8 @@ class DeepseekV41Attention(DsV41CacheMixin, upstream.DeepseekV4Attention):
         if spec is None:
             return None
         mla_spec = cast(MLAAttentionSpec, spec)
+        # Report 512B NoPE row + 128B companion RoPE = 640B per state so vLLM's
+        # `page_size_bytes` budget covers both physical banks.
         state_bytes = ROW_BYTES + self.rope_head_dim * torch.bfloat16.itemsize
         return replace(
             mla_spec,
@@ -741,6 +749,11 @@ class DeepseekV41Attention(DsV41CacheMixin, upstream.DeepseekV4Attention):
 
     def _gather_seq_swa(self, live_kv: Tensor | None = None) -> Tensor | None:
         swa_cache, swa_meta = self._swa_state()
+        # Output shape & role (S=num_seqs, W=window_size, B=dspark_block_size):
+        # - Causal (non_causal=False): [S, W, D] with committed swa_cache rows
+        #   only; current-step KV is appended via torch.cat in forward_mqa.
+        # - DSpark (non_causal=True): [S, W + B, D] with committed swa_cache
+        #   rows + current-step live_kv together (no swa_cache write or cat).
         non_causal = self.non_causal_multi_token_decode
         block_tokens = max(0, self.dspark_block_size) if non_causal else 0
         eff_window = self.window_size + block_tokens
@@ -761,18 +774,26 @@ class DeepseekV41Attention(DsV41CacheMixin, upstream.DeepseekV4Attention):
         cu_query = cast(Tensor, swa_meta.query_start_loc).to(torch.int64)
         query_lens = cu_query[1:] - cu_query[:-1]
         live_count = 0 if live_kv is None else live_kv.shape[0]
+        # Only used on DSpark draft layers L40..L42 where `live_per_seq` equals
+        # `query_lens`; `minimum` and `clamp` are defensive bounds checks.
         live_per_seq = torch.minimum(
             query_lens, (live_count - cu_query[:-1]).clamp_min(0)
         ).clamp(0, block_tokens)
 
+        # Inclusive right edge `window_end` of the gathered window; e.g., for
+        # `seq_lens` = 25 with 20 cached tokens 0..19 and 5 new tokens 20..24:
         if non_causal:
-            seq_end = seq_lens - 1
+            # DSpark splices 20..24 from `live_kv` right here, so set
+            # `window_end` to 24.
+            window_end = seq_lens - 1
             committed_end: Tensor | None = seq_lens - live_per_seq
-            window_base = (seq_end - eff_window + 1).clamp_min(0)
+            window_base = (window_end - eff_window + 1).clamp_min(0)
         else:
-            seq_end = seq_lens - query_lens - 1
+            # Causal appends 20..24 later in `forward_mqa`, not here, so set
+            # `window_end` to 19.
+            window_end = seq_lens - query_lens - 1
             committed_end = None
-            window_base = seq_end - eff_window + 1
+            window_base = window_end - eff_window + 1
 
         window_offsets = torch.arange(
             eff_window, dtype=torch.int64, device=seq_lens.device
@@ -854,6 +875,9 @@ class DeepseekV41Attention(DsV41CacheMixin, upstream.DeepseekV4Attention):
         kv_score = self.compressor.project(hidden_states)
         if sp_sharded:
             kv_score = sp_all_gather(kv_score)[: positions.shape[0]]
+        # Publish indexer K eagerly here because this KV-only encoder hook skips
+        # self.indexer(...), whereas _prepare_and_attn leaves produce_indexer_k
+        # False so self.indexer.forward() writes K once without duplicating it.
         self._compress_kv(kv_score, positions, produce_indexer_k=True)
 
     def forward_kv(self, positions: Tensor, hidden_states: Tensor) -> None:
@@ -886,9 +910,14 @@ class DeepseekV41Attention(DsV41CacheMixin, upstream.DeepseekV4Attention):
             compressed_latent: Tensor | None = None
         else:
             pre_write_swa = self._gather_seq_swa()
+            # Pass after_read so XLA orders the prefix gather before circular
+            # page scatters that may reuse an outgoing SWA block in this step.
             self._write_swa_kv(
                 kv_rotated, positions, after_read=pre_write_swa is not None
             )
+            # On the CED boundary layer (e.g., L20), write_encoder_global_kv
+            # already populated global KV and k_cache at encoder end; skip
+            # re-compressing (and produce_k via None) in the decoder stage.
             if (
                 self.compressor is not None
                 and not self.ced_global_from_encoder
@@ -941,11 +970,15 @@ class DeepseekV41Attention(DsV41CacheMixin, upstream.DeepseekV4Attention):
         )
 
         if self.non_causal_multi_token_decode:
+            # Reuse the causal kernel (kv_pos <= pos_t) for bidirectional DSpark
+            # blocks by viewing the batch as T 1-token decode pseudo-sequences
+            # all ending at their parent request's seq_len - 1.
             req_indices = (
                 token_requests(swa_meta, positions)
                 .clamp(0, seq_lens.shape[0] - 1)
                 .long()
             )
+            # Clamp empty 0-length slots to 1 so kernel's (seq_len - 1) >= 0.
             seq_lens = (
                 (seq_lens.to(torch.int64)[req_indices] - 1).clamp_min(0).add(1).int()
             )
@@ -984,6 +1017,8 @@ class DeepseekV41Attention(DsV41CacheMixin, upstream.DeepseekV4Attention):
             and comp_bt.numel() > 0
             and self.topk_indices_buffer is not None
         ):
+            # Global MLA layers (e.g., L2..L39): gather top-K compressed NoPE
+            # and RoPE keys from the shared source pool via SparseCore.
             topk_indices = self.topk_indices_buffer[:num_tokens]
             gathered_nope, gathered_rope = _gather_compressed_kv(
                 comp_cache,
@@ -993,6 +1028,8 @@ class DeepseekV41Attention(DsV41CacheMixin, upstream.DeepseekV4Attention):
             )
             kv_ratio = self.compress_ratio
         else:
+            # Pure SWA layers (e.g., L0..L1, DSpark L40..L42): pass -1 top-K
+            # placeholders so the fused kernel skips sparse MLA and runs SWA.
             topk_indices = seq_lens.new_full((num_tokens, _EMPTY_SPARSE_TOPK), -1)
             gathered_nope = topk_indices.new_zeros(
                 (num_tokens, _EMPTY_SPARSE_TOPK, ROW_WORDS)
