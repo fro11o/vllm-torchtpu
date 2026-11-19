@@ -178,12 +178,21 @@ def replay_starts(
     *,
     ced_decoder: bool = False,
 ) -> Tensor | None:
+    # Prefix-hit SWA replay start: prefix-hit token count minus SWA window.
     window_starts = _context_starts("deepseek_v41_window_starts", num_seqs, device)
+    # CED decoder start: max of (prompt length minus SWA window) and above.
     decoder_starts = _context_starts("deepseek_v41_replay_starts", num_seqs, device)
     if ced_decoder:
+        # Decoder SWA (e.g., L20..L39): in production both keys are set and
+        # `decoder_starts` >= `window_starts` due to CED tail narrowing;
+        # `torch.maximum` enforces the stricter bound if both are present.
         if window_starts is not None and decoder_starts is not None:
             return torch.maximum(window_starts, decoder_starts)
+        # Unit-test fallback when only one key is populated in ForwardContext.
         return decoder_starts if decoder_starts is not None else window_starts
+    # Encoder SWA (e.g., L0..L19), non-CED, and `not_replayed`: ignore decoder
+    # tail narrowing so full-prompt encoder SWA is preserved (`decoder_starts`
+    # is only a fallback when unit tests omit `deepseek_v41_window_starts`).
     return window_starts if window_starts is not None else decoder_starts
 
 

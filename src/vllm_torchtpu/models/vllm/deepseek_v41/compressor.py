@@ -171,7 +171,7 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
         self.window_size: int = vllm_config.model_config.hf_config.sliding_window
         if self.compress_ratio > 1:
             state_prefix = f"{prefix}.state_cache"
-            state_dim = _COMPRESS_PAIR_SIZE * self.head_dim
+            state_dim = _COMPRESS_PAIR_SIZE * self.head_dim  # kv_state + score_state
             # Avoid keeping upstream CompressorStateCache in static_forward_context.
             self._static_forward_context.pop(state_prefix, None)
             self.state_cache = CompressorStateCache(

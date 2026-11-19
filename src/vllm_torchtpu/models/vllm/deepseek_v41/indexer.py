@@ -73,10 +73,12 @@ def publish_candidate_blocks(
     active = (token_rows < query_end.to(device)) & (positions >= 0)
     compressed_len = torch.where(active, (positions.int() + 1) // compress_ratio, 0)
     num_blocks = (compressed_len + candidate_block_size - 1) // candidate_block_size
+    # Step 1: Build `all_blocks` for short contexts where all blocks fit.
     iota = torch.arange(candidate_topk_blocks, dtype=torch.int32, device=device)
     iota_2d = iota.unsqueeze(0)
     all_blocks = torch.where(iota_2d < num_blocks.unsqueeze(1), iota_2d, -1)
 
+    # Step 2: Build `dedup_blocks` for long contexts from `tail_block` + top-k.
     tail_block = torch.where(
         compressed_len > 0, (compressed_len - 1) // candidate_block_size, -1
     ).unsqueeze(1)
@@ -291,6 +293,8 @@ class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
             -1, self.n_head, self.head_dim
         )
         q_rotated = rotate_rope(query_heads, positions, rotary_emb, self.kv_rope_op)
+        # word_scores.py unpacks packed int32 BF16 keys into [even_64 | odd_64]
+        # lanes to avoid cross-lane shuffles; permute q to match so q.k holds.
         q_split = torch.cat((q_rotated[..., 0::2], q_rotated[..., 1::2]), dim=-1)
         scale = self.softmax_scale * (self.n_head**-0.5)
         scaled_weights = (indexer_weights.float() * scale).unsqueeze(-1)
@@ -350,6 +354,8 @@ class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
                     table.int() * page_scale + page_offset,
                 )
             else:
+                # Unit-test fallback: tests may assign pre-packed int32 word
+                # rows directly to kv_cache without binding PagedCacheRows.
                 k_pool = k_cache
                 phys_block_tables = table.int()
 
@@ -360,6 +366,8 @@ class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
                 and candidate_block_size > 0
                 and max_keys > candidate_blocks.shape[1] * candidate_block_size
             ):
+                # Candidate consumers (e.g., L24/28/32/36): expand the source
+                # layer's candidate block IDs into key indices for top-K.
                 block_ids = candidate_blocks[:num_tokens].unsqueeze(-1)
                 offsets = torch.arange(
                     candidate_block_size, dtype=torch.int32, device=block_ids.device
@@ -389,6 +397,8 @@ class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
                 and indexer_op_module.candidate_write
                 and candidate_block_size > 0
             ):
+                # Candidate source (e.g., L20): publish deduplicated candidate
+                # block IDs into the shared buffer for downstream consumers.
                 candidate_topk_blocks = candidate_blocks.shape[1]
                 published = publish_candidate_blocks(
                     topk,
